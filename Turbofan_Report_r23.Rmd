@@ -1,0 +1,670 @@
+
+---
+title: "Predictive Maintenance of Turbofan Aircraft Engines using Machine Learning"
+urlcolor: orange
+output:
+  pdf_document:
+    dev: png
+    toc: true
+    toc_depth: 2
+
+---
+
+
+```{r Install Packages, include=FALSE}
+
+
+#Note: This script may take a while to run.
+      #Developed on a machine with the below specifications:
+      #CPU: Intel(R) Core(TM) i5-7300U CPU @ 2.60GHz, 2712 Mhz, 2 Core(s), 4 Logical Processor(s)
+      #RAM: 8.00 GB
+
+
+
+
+
+##Installing Packages
+
+# List of packages for session
+.packages = c("tidyverse",       #tidy alvvays and forever!
+              "car",             #for calculating variable inflation factor
+              "caret",           #Classification And REgression Training
+              "corrplot",        #correlation plots
+              "cowplot",         #solve x-axis misalignment when plotting, and better-looking defaults for ggplots
+              "factoextra",      #visualize PCA
+              "GGally",          #Pairs plots
+              "gridExtra",       #combine plots
+              "knitr",           #report output
+              "kableExtra",      #nice tables
+              "lubridate",       #date math!
+              "RColorBrewer",    #custom colour schemes
+              "reshape2",        #acast to create matrix
+              "scales",          #percent_format, among other things
+              "splitstackshape"  #explode pipe-delimited data to one-hot encoded dummy variables
+             
+              )
+
+
+# Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+
+
+```
+
+```{r Functions and Hooks, include=FALSE}
+# Customize knitr output
+
+#Set default chunk behaviour to *not* show code. We will only show code and charts we wish to.
+knitr::opts_chunk$set(echo=FALSE)
+
+#Set Thousands Separator for inline output
+knitr::knit_hooks$set(inline = function(x) { if(!is.numeric(x)){ x }else{ prettyNum(round(x,2), big.mark=",") } })
+
+#we've already set the graphic device to "png" in the RMD options. the default device for pdfs draws every point of a scatterplot, creatinvg *very* big files.
+#But png is not as crisp, so we will set a higher resolution for pdf output of plots. 
+knitr::opts_chunk$set(dpi=300)
+
+#Create Kable wrapper function for thousands separator in table output, and nice formating with kableExtra
+niceKable = function(...) {
+  knitr::kable(..., format.args = list(decimal.mark = '.', big.mark = ",")) %>% kable_styling()
+}
+
+# turn off scientific display
+options(scipen=999) 
+
+
+#Make pretty confusion matrices in ggplot2
+ggplotConfusionMatrix <- function(m){
+  mytitle <- paste("Accuracy", percent_format()(m$overall[1]),
+                   "Kappa", percent_format()(m$overall[2]))
+  p <-
+    ggplot(data = as.data.frame(m$table) ,
+           aes(x = reorder(Reference, desc(Reference)), 
+               y = reorder(Prediction, desc(Prediction)))) +
+    xlab( "Reference") +
+    ylab("Prediction") + 
+    geom_tile(aes(fill = log(Freq)), colour = "white") +
+    scale_fill_gradient(low = "white", high = "#8EB4C0") +
+    geom_text(aes(x = Reference, y = Prediction, label = Freq)) +
+    theme(legend.position = "none") +
+    ggtitle(mytitle)
+  return(p)
+}
+
+
+
+```
+
+# Introduction
+
+This report will oultine a method to predict remaining useful life "RUL" of commercial turbofan engines, based on a dataset containing values from multiple sensors and operational settings.
+
+This project is being completed for *Data Science: Capstone* (PH125.9x) course in the HarvardX Professional Certificate Data Science Program.  The methods used will be those methods taught in the program. Computationally expensive methods will be avoided.
+
+The data set was provided by the Prognostics CoE at NASA Ames. 
+
+> The Modular Aero-Propulsion System Simulation (MAPSS) is a flexible turbofan engine simulation environment that provides easy access to health, control, and engine parameters. 
+
+> Both military and commercial turbofan engine versions of MAPSS exist. The commercial versions, C-MAPSS and C-MAPSS40k, represent high-bypass engines capable of 90,000 lbf thrust and 40,000 lbf thrust, respectively. 
+
+> Data sets consists of multiple multivariate time series. Each data set is further divided into training and test subsets. Each time series is from a different engine –  the data can be considered to be from a fleet of engines of the same type. Each engine starts with different degrees of initial wear and manufacturing variation which is unknown to the user. This wear and variation is considered normal, i.e., it is not considered a fault condition. 
+There are three operational settings that have a substantial effect on engine performance. These settings are also included in the data. The data is contaminated with sensor noise.
+
+> Also provided [is] a vector of true Remaining Useful Life (RUL) values for the test data.
+
+```{r}
+
+#Set the data. Source is here: https://ti.arc.nasa.gov/c/6/
+#Column names are derived from the Readme included with the data. 
+
+#The real names of the settings and Sensors can be found in this article:
+#https://pdfs.semanticscholar.org/69eb/732555d5ce743dc2e598384ea9d0e77fbbf4.pdf
+
+colNames = c("unit", 
+            "cycle",
+            "setting1",
+            "setting2",
+            "setting3",
+            "sensor1",
+            "sensor2",
+            "sensor3",
+            "sensor4",
+            "sensor5",
+            "sensor6",
+            "sensor7",
+            "sensor8",
+            "sensor9",
+            "sensor10",
+            "sensor11",
+            "sensor12",
+            "sensor13",
+            "sensor14",
+            "sensor15",
+            "sensor16",
+            "sensor17",
+            "sensor18",
+            "sensor19",
+            "sensor20",
+            "sensor21"
+            )
+
+
+test <- read.table("test_FD001.txt", col.names = colNames)
+trueRUL <- read.table("RUL_FD001.txt", col.names = "RUL")
+train <- read.table("train_FD001.txt", col.names = colNames)
+
+```
+
+Remaining useful life is the target variable. Instead of treating this as a regression problem and solving for RUL directly, this project will define an engine health status and classify engines as operating in one of three statuses: "Normal", "Monitor" or "Critical".  Inspection or maintenance activities would be advisable for any engine that reaches the "Monitor" status.
+
+# Methods/Analysis
+
+This analysis will be performed on the *FD001* test and train sets, and the associated vector of RUL values for the test set.
+
+## Exploratory Data Analysis
+
+There are no null values in the provided Test, Train or RUL datasets.
+
+```{r}
+
+data.frame("Train"= anyNA(train), "Test" = anyNA(test), "RUL"= anyNA(trueRUL)) %>% niceKable()
+```
+
+
+
+
+```{r include=FALSE}
+#Check individual columns for NAs
+#In this case, not necessary
+sapply(test, {function(x) any(is.na(x))})
+sapply(train, {function(x) any(is.na(x))})
+sapply(trueRUL, {function(x) any(is.na(x))})
+```
+
+The training data appears as follows.
+
+```{r echo=FALSE}
+head(train)  %>% kable %>% kable_styling()
+```
+
+NASA, defines the "remaining useful life" for each engine as below:
+
+> The engine is operating normally at the start of each time series, and develops a fault at some point during the series.  In the training set, the fault grows in magnitude until system failure. In the test set, the time series ends some time prior to system failure.  
+
+Therefore, for the training set, "remaining useful life" will be calculated for each engine, ending at 0 on the final cycle. 
+
+
+```{r}
+
+# Add remaining useful life, counting down from first cycle to end on 0 at last cycle (failure)
+train1 <- train %>% 
+    #mutate(unit = as.factor(unit)) %>%
+    group_by(unit) %>% 
+    mutate(RUL = n() - row_number() )
+
+#Add ground truth RUL to test set
+test1 <- test %>% 
+  #filter(unit == 2) %>%
+  group_by(unit) %>%
+  mutate(RUL = trueRUL$RUL[unit] + n() - row_number() )
+
+#test$RUL
+#trueRUL$RUL[2]
+```
+
+
+```{r echo=FALSE}
+
+# Print a nice, truncated table with RUL values.
+train_view <- train1
+train_view$sensor2 = "..."
+train_view[6,] ="..."
+train_view <- train_view %>% select(-everything(), unit, cycle, setting1, setting2, setting3, sensor1, sensor2, RUL) %>% rename("..." = sensor2)
+
+train_view[c(1:6,190:192),]  %>% kable %>% kable_styling()
+```
+
+```{r}
+# Count how many cycles in engine 1, just for easier embedded number in paragraph below
+test_engine1cycles <- test1 %>% group_by(unit) %>% filter(unit == 1) %>% ungroup() %>% count()
+test_engine1cycles <- as.numeric(test_engine1cycles) - 1
+```
+
+For the test set, the "RUL" vector of values will be added to each engine on the final cycle, and then iteratively increased for each cycle prior. For example, Engine 1 had `r trueRUL[1,]` cycles of "remaining useful life" at the point where the test data ends. With only `r test_engine1cycles` recorded for Engine 1, it will therefore start with 142 cycles of "remaining useful life".
+
+```{r}
+
+test_view <- test1
+test_view[6,] ="..."
+test_view <- test_view %>% select(-everything(), unit, cycle, setting1, setting2, setting3, sensor1, sensor2, RUL) %>% rename("..." = sensor2)
+
+test_view[c(1:6,30:33),]  %>% kable %>% kable_styling()
+
+
+```
+
+There are 100 engines in each dataset. As the chart below indicates, the *Test* engines contain fewer operating cycles.
+
+```{r}
+
+
+#Distributon of cycles in TRAIN
+trainCycles <- train %>% group_by(unit) %>% 
+  summarize(cycles = max(cycle)) %>%
+  ggplot(aes  (x= reorder(unit, desc(cycles)), y=cycles ) ) + 
+    ggtitle("Train Set") + 
+  xlab("Unit") +
+  geom_bar(stat = "identity", fill = "#3F7F93")+
+  ylim(0, max(test$cycle, train$cycle)) + #set chart y-axis to maximum cycle in either test or train
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+#Distributon of cycles in TEST
+testCycles <- test %>% group_by(unit) %>% 
+  summarize(cycles = max(cycle)) %>%
+  ggplot(aes  (x= reorder(unit, desc(cycles)), y=cycles ) ) + 
+  ggtitle("Test Set") + 
+  xlab("Unit") +
+  geom_bar(stat = "identity", fill = "#8EB4C0") +
+  ylim(0, max(test$cycle, train$cycle)) + #set chart y-axis to maximum cycle in either test or train
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+
+
+grid.arrange(ggplotGrob(trainCycles), ggplotGrob(testCycles), ncol = 2)
+
+```
+
+\newpage
+
+## Sensor Visualization
+Below is a visual exploration of the sensor and settings values for each predictor. The chart is aligned "to the right" on the RUL values. Each engine is run until failure, and the right-most point is "RUL = 0" - the point of failure. This visualization accounts for the fact that not all engines have an equal number of cycles. Some sensors show a clear trend as the engine approaches failure.
+
+
+```{r fig.height = 10}
+
+plotTrain <- train1 %>%
+#  filter(unit == 1) %>%
+  ungroup() %>% 
+  select(-unit, - cycle) %>%
+  melt(id="RUL")
+
+
+  ggplot(plotTrain,aes(x=RUL,y=value)) + 
+  facet_wrap(~ variable, scales="free_y", ncol = 3) + 
+  geom_line(alpha = 0.5, colour = "#8EB4C0")+
+  scale_x_reverse() 
+  # theme(strip.text.x = element_text(size = 8)) 
+  
+
+
+```
+
+## Normalization / Standardization
+
+The predictor values are not normalized, and some contain no meaningful content.  The values for each setting and sensor will be pre-processed by scaling and centering. Predictors with near-zero variance will be automatically removed. The below output shows which predicors were centered, scaled, and removed.
+
+```{r}
+
+train_norm <- train1
+test_norm <- test1 
+
+
+#NORMALIZE THE VARIABLES
+
+
+#Develop preprocess parameters on training data, excluding categorical columns 1-2 (unit and cycle), and 27 (RUL)
+#Center and scale values, remove paramaters with "near-zero variation"
+
+preProcValues <- preProcess(train1[3:26], method = c("center", "scale", "nzv"))
+
+#Apply the same preprocess parameters to transform both train *and* test into normalized values
+train_norm <- predict(preProcValues, train1)
+test_norm <- predict(preProcValues, test1)
+
+
+preProcValues$method
+```
+
+The same parameters used in pre-rocessing the training set will be applied to pre-processing the test set.
+
+\newpage
+
+The data is now normalized:
+
+```{r fig.height = 10.5}
+
+plotTrain <- train_norm %>%
+#  filter(unit == 1) %>%
+  ungroup() %>% 
+  select(-unit, - cycle) %>%
+  melt(id="RUL")
+
+
+  ggplot(plotTrain,aes(x=RUL,y=value)) + 
+  facet_wrap(~ variable, scales="free_y", ncol = 3) + 
+  geom_line(alpha = 0.5, colour = "#8EB4C0")+
+  scale_x_reverse() 
+  # theme(strip.text.x = element_text(size = 8)) 
+  
+
+
+```
+
+## Predictor Correlation
+
+A simple linear model will be generated to check for multicollinearity in the predictors, by computing the *Variance Inflation Factor*.
+
+```{r}
+simple_lm <- lm(RUL ~ ., data = train_norm)
+vif(simple_lm) %>% niceKable
+
+```
+
+Sensors9 and 14 have a VIF greater than 10 and will be dropped from the data. A new linear model will be generated and the VIF computed again for the remaining predictors. Sensor 9 records the "Physical core speed (rpm)", whereas Sensor 14 records the "Corrected core speed (rpm)" (Saxena and Simon, 2008). Corrected speed adjusts component rotation to ambient conditions at sea level, so it is likely that Sensor 14 is the preferable of the two. Sensor 9 will be dropped from the data, and the VIF re-computed.
+
+```{r}
+train_norm <- train_norm %>% select(-sensor9)
+
+simple_lm <- lm(RUL ~ ., data = train_norm)
+vif(simple_lm) %>% niceKable()
+
+```
+
+A correlation plot will be completed for the remaining, normalized predictors.
+
+
+```{r}
+
+train_cor <- train_norm %>% ungroup() %>% select(-unit, -cycle)
+
+corrplot(cor(train_cor), method = "square", type="upper")
+
+
+```
+
+The remaining operational *settings* have very little correlation with RUL. The remaining *sensors* are strongly correlated with each other, and most also have a strong correlation with RUL. Setting1 (Altitude) and Setting2 (Mach Number) are removed from the data.
+
+```{r}
+train_norm <- train_norm %>% select(-setting1, -setting2)
+
+```
+
+A pairs plot will be generated from the remaining predictors.
+
+```{r}
+
+train_pairs <- train_norm %>% ungroup() %>% select(-unit, -cycle) %>% ggpairs(., progress = FALSE) 
+train_pairs
+```
+
+
+
+## Feature Engineering
+
+Three engine health statuses are added to the dataset. An engine will be flagged "Critical" when it has 15 or fewer cycles remaining. An engine will be flagged "Monitor" at 40 or fewer cycles, and "Normal" in all other cases.
+
+
+```{r}
+
+# Create test and train sets
+
+train_x    <- train_norm   %>% ungroup() %>%
+              select(-unit, -cycle, -RUL)
+                                        
+
+train_y <-    train_norm %>% ungroup() %>%
+              mutate(status = case_when(
+                     RUL <= 15  ~ "Critical",
+                     RUL <= 40  ~ "Monitor",
+                     RUL >  40 ~ "Normal"),
+                     status = as.factor(status)) %>% 
+              select(status)
+
+
+test_x    <- test_norm   %>% ungroup() %>%
+              select(-unit, -cycle, -RUL)
+                                        
+
+test_y <-     test_norm %>% ungroup() %>%
+              mutate(status = case_when(
+                     RUL <= 15  ~ "Critical",
+                     RUL <= 40  ~ "Monitor",
+                     RUL >  40 ~ "Normal"),
+                     status = as.factor(status)) %>% 
+              select(status)
+
+```
+
+
+
+```{r}
+
+#===========================================
+# Plot Nice View of Engine Health Over Time
+#===========================================
+
+train_x_comp <- train_norm %>% ungroup()
+train_y_comp <- train_y %>% mutate(status = as.factor(status))
+train_complete <- cbind(train_x_comp, train_y_comp)
+
+
+  train_complete %>% 
+  ggplot(aes(x=1, y=cycle, fill=status)) + 
+  facet_wrap(~ unit, scales="free_y", ncol = 4, strip.position="left") + 
+  ggtitle("Engine Health in The Training Set") +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values=c("#c3553a", "#DB9A8A", "#8EB4C0")) +
+  xlab("Unit") +
+  coord_flip() +
+  theme(strip.background = element_blank(),
+    strip.text.y = element_text(angle = 180, size = 8),
+    axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+    axis.line = element_blank()  
+    )
+
+```
+
+
+
+
+## Modeling
+
+A random forest will be fit to the test data using the "ranger" method from the "caret" package.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+
+
+# Build train control...
+fitControl <- trainControl(method = "CV",
+                           number = 5,
+                           verboseIter = TRUE)
+
+#...and tuning grid
+tgrid <- expand.grid(
+  .mtry = 2:6,
+  #.splitrule = "extratrees",
+  .splitrule = c("gini", "extratrees"),
+  .min.node.size = c(10, 20)
+)
+
+# Fit a random forest model using caret and the "ranger" package.
+# Using capture.output to avoid the unsolicited console messages printed for each try. Only added once the model is finalized.
+fit <- #capture.output(
+             train(x = train_x,
+             y = train_y$status,
+             method = "ranger", 
+               tuneGrid = tgrid,
+               trControl = fitControl,
+               importance = "permutation"
+             )
+        #)
+
+```
+
+# Results
+
+
+## Cross-Validation
+
+The following chart shows the combinations of "minimal node size" and "mtry" used in fitting the model. 
+
+```{r echo=FALSE}
+plot(fit)
+```
+
+The best accuracy of `r max(fit$results$Accuracy)` was achieved by choosing the `splitting rule` of `r as.character(fit$bestTune$splitrule)`, an `mtry` value of `r fit$bestTune$mtry` and a node size of `r fit$bestTune$min.node.size`.
+
+## Variable Importance
+
+Based on the "variable importance plot", the following predictors were most meaningful in the prediction.
+
+```{r}
+plot(varImp(fit))
+```
+
+
+## Confusion Matrix
+
+The model achieved performance that is described by the following statistics.
+
+```{r}
+predict_train <- predict(fit, train_x)
+predict_test  <- predict(fit, test_x)
+
+
+cm_train <- confusionMatrix(train_y$status, predict_train)
+cm_test  <- confusionMatrix(test_y$status, predict_test, positive = "Critical")
+
+cm_test
+
+```
+
+Graphically, as a confusion matrix:
+
+```{r echo=FALSE}
+ggplotConfusionMatrix(cm_test)
+
+```
+
+## True vs. Predicted Values
+
+The following two pages show the "true" vs. "predicted" statuses for each of the 100 engines in the test set. They can be compared by "flip booking" between the two pages.
+
+```{r include=FALSE}
+
+#=========================================================
+# Create Datasets with Ground Truth vs. Predicted States
+#=========================================================
+
+test_x_comp <- test_norm %>% ungroup()
+test_y_comp <- test_y %>% mutate(status = as.factor(status))
+test_complete <- cbind(test_x_comp, test_y_comp)
+
+
+
+pred_y_comp <- predict_test
+pred_complete <- cbind(test_x_comp, pred_y_comp)
+pred_complete <- pred_complete %>% mutate(status = pred_y_comp) %>% select(-pred_y_comp)
+
+
+#=========================================================
+# Create Custom Colour Scale for Status
+#=========================================================
+
+myColors <- brewer.pal(3,"Spectral")
+names(myColors) <- levels(test_complete$status)
+colScale <- scale_colour_manual(name = "State",values = myColors)
+
+
+
+```
+
+
+```{r eval=FALSE, include=FALSE}
+
+#=========================================================
+# Detail of Sensor 11 In Ground Truth vs. Predicted
+#=========================================================
+
+  ggplot(test_complete,aes(x=RUL,y=sensor11, colour=status)) + 
+  geom_line()+
+  scale_x_reverse() +
+  theme(strip.text.x = element_text(size = 150)) +
+  colScale
+
+  ggplot(pred_complete,aes(x=RUL,y=sensor11, colour=status)) + 
+  geom_line()+
+  scale_x_reverse() +
+  theme(strip.text.x = element_text(size = 150)) +
+  colScale
+  
+  
+```
+
+\newpage
+
+### Test Values
+```{r}
+  test_complete %>% 
+  ggplot(aes(x=1, y=cycle, fill=status)) + 
+  facet_wrap(~ unit, scales="free_y", ncol = 4, strip.position="left") + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values=c("#c3553a", "#DB9A8A", "#8EB4C0")) +
+  xlab("unit") +
+  coord_flip() +
+  theme(strip.background = element_blank(),
+    strip.text.y = element_text(angle = 180, size = 8),
+    axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+    axis.line = element_blank()  
+    )
+
+```
+
+\newpage
+
+### Predicted Values
+```{r}
+
+
+  pred_complete %>%
+  ggplot(aes(x=1, y=cycle, fill=status)) + 
+  facet_wrap(~ unit, scales="free_y", ncol = 4, strip.position="left") + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values=c("#c3553a", "#DB9A8A", "#8EB4C0")) +
+  xlab("unit") +
+  coord_flip() +
+  theme(strip.background = element_blank(),
+    strip.text.y = element_text(angle = 180, size = 8),
+    axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+    axis.line = element_blank()  
+    )
+
+
+```
+
+
+# Conclusion
+
+In the test set, no engine was run until failure. The engine that was closest to failure had only `r min(trueRUL)` cycles remaining.
+
+When predicting failure of a commercial turbofan aircraft engine, the worst kind of error is a False Negative - classifying an engine as safe, when it is not.  While False Positives add cost by requiring maintenance or inspection earlier than necessary, this is still preferable to an engine failing prematurely.
+
+Our model correctly classified the majority of engine states. All engines that were truly critical were classified in either the "Critical" or "Monitor" state, with the majority being correctly classified as "Critical". Engines in the "monitor" state would ideally be inspected and/or maintained prior to reaching the "Critical" state or worse, failing entirely.
+
+## Future Considerations
+
+While not explored here, a neural network "Long-Short-Term Memory" (LSTM) approach may achieve improved performance, particularly with respect to improving sensitivity to the "Critical" status. Another option would be to treat this as a regressiong problem and try to estimate RUL directly. Methods of denoising or smoothing the data may also result in improvement.
+
+# Citations
+
+A. Saxena and K. Goebel (2008). "Turbofan Engine Degradation Simulation Data Set", NASA Ames Prognostics Data Repository (http://ti.arc.nasa.gov/project/prognostic-data-repository), NASA Ames Research Center, Moffett Field, CA
+
+"Modular Aero-Propulsion System Simulations - MAPSS, C-MAPSS, C-MAPSS40k", Nasa Intelligent Control and Autonomy Branch (https://www.grc.nasa.gov/www/cdtb/software/mapss.html), NASA Glenn Research Center
