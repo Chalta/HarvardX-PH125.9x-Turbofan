@@ -1,0 +1,198 @@
+```{r message=FALSE, warning=FALSE}
+
+# This script generates as its output *only* the confusion matrix and summary statistics of the final model. 
+# For a more detailed sense of the methodology, see the full Rmd or .PDF report.
+
+#Note: This script may take a while to run. 
+      #It took just over 20 minutes on a machine with the below specifications:
+      #CPU: Intel(R) Core(TM) i5-7300U CPU @ 2.60GHz, 2712 Mhz, 2 Core(s), 4 Logical Processor(s)
+      #RAM: 8.00 GB
+
+
+
+
+#Github repository here: https://github.com/Chalta/HarvardX-PH125.9x-Turbofan
+
+
+##Installing Packages
+
+# List of packages for session
+.packages = c("tidyverse",       #tidy alvvays and forever!
+              "car",             #for calculating variance inflation factor
+              "caret",           #Classification And REgression Training
+              "corrplot",        #correlation plots
+              "cowplot",         #solve x-axis misalignment when plotting, and better-looking defaults for ggplots
+              "factoextra",      #visualize PCA
+              "GGally",          #Pairs plots
+              "gridExtra",       #combine plots
+              "knitr",           #report output
+              "kableExtra",      #nice tables
+              "reshape2",        #acast to create matrix
+              "scales"           #percent_format, among other things
+              )
+
+
+# Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+
+
+
+#Set the data. Source is here: https://ti.arc.nasa.gov/c/6/
+#Column names are derived from the Readme included with the data. 
+
+#The real names of the settings and Sensors can be found in this article, which itself references original article by Saxena and Simon, both cited at the end of this document.
+
+#https://pdfs.semanticscholar.org/69eb/732555d5ce743dc2e598384ea9d0e77fbbf4.pdf
+
+colNames = c("unit", 
+            "cycle",
+            "setting1",
+            "setting2",
+            "setting3",
+            "sensor1",
+            "sensor2",
+            "sensor3",
+            "sensor4",
+            "sensor5",
+            "sensor6",
+            "sensor7",
+            "sensor8",
+            "sensor9",
+            "sensor10",
+            "sensor11",
+            "sensor12",
+            "sensor13",
+            "sensor14",
+            "sensor15",
+            "sensor16",
+            "sensor17",
+            "sensor18",
+            "sensor19",
+            "sensor20",
+            "sensor21"
+            )
+
+
+test <- read.table("test_FD001.txt", col.names = colNames)
+trueRUL <- read.table("RUL_FD001.txt", col.names = "RUL")
+train <- read.table("train_FD001.txt", col.names = colNames)
+
+
+
+# Add remaining useful life, counting down from first cycle to end on 0 at last cycle (failure)
+train1 <- train %>% 
+    #mutate(unit = as.factor(unit)) %>%
+    group_by(unit) %>% 
+    mutate(RUL = n() - row_number() )
+
+#Add ground truth RUL to test set
+test1 <- test %>% 
+  #filter(unit == 2) %>%
+  group_by(unit) %>%
+  mutate(RUL = trueRUL$RUL[unit] + n() - row_number() )
+
+
+## Normalization / Standardization
+
+
+#Develop preprocess parameters on training data, excluding categorical columns 1-2 (unit and cycle), and 27 (RUL)
+#Center and scale values, remove paramaters with "near-zero variation"
+
+preProcValues <- preProcess(train1[3:26], method = c("center", "scale", "nzv"))
+
+#Apply the same preprocess parameters to transform both train *and* test into normalized values
+train_norm <- predict(preProcValues, train1)
+test_norm <- predict(preProcValues, test1)
+
+
+
+#The operational *settings* have very little correlation with RUL. Setting 1 (Altitude) and Setting 2 (Mach Number) will be removed from the data.
+#Sensor 9 has a stronger correlation with RUL, so Sensor 14 will be dropped
+
+train_norm <- train_norm %>% select(-setting1, -setting2, -sensor14)  #Training data
+test_norm  <- test_norm  %>% select(-setting1, -setting2, -sensor14)  #Do the same for test
+
+
+## Feature Engineering
+
+#Three engine health statuses are added to the dataset. An engine will be flagged "Critical" when it has 15 or fewer cycles remaining. An engine will be flagged "Monitor" at 40 or fewer cycles, and "Normal" in all other cases.
+
+
+
+
+# Create test and train sets
+
+train_x    <- train_norm   %>% ungroup() %>%
+              select(-unit, -cycle, -RUL)
+                                        
+
+train_y <-    train_norm %>% ungroup() %>%
+              mutate(status = case_when(
+                     RUL <= 15  ~ "Critical",
+                     RUL <= 40  ~ "Monitor",
+                     RUL >  40 ~ "Normal"),
+                     status = as.factor(status)) %>% 
+              select(status)
+
+
+test_x    <- test_norm   %>% ungroup() %>%
+              select(-unit, -cycle, -RUL)
+                                        
+
+test_y <-     test_norm %>% ungroup() %>%
+              mutate(status = case_when(
+                     RUL <= 15  ~ "Critical",
+                     RUL <= 40  ~ "Monitor",
+                     RUL >  40 ~ "Normal"),
+                     status = as.factor(status)) %>% 
+              select(status)
+
+
+## Modeling
+
+
+#A random forest was fit to the test data using the "ranger" method from the "caret" package. Cross-validation was completed using "k" folds.
+k = 5 
+
+# Build train control...
+fitControl <- trainControl(method = "CV",
+                           number = k,
+                           verboseIter = TRUE)
+
+#...and tuning grid
+tgrid <- expand.grid(
+  .mtry = 2:6,
+  #.splitrule = "extratrees",
+  .splitrule = c("gini", "extratrees"),
+  .min.node.size = c(10, 20)
+)
+
+# Fit a random forest model using caret and the "ranger" package.
+
+fit <- 
+             train(x = train_x,
+             y = train_y$status,
+             method = "ranger", 
+               tuneGrid = tgrid,
+               trControl = fitControl,
+               importance = "permutation"
+             )
+
+
+## Model Performance
+
+predict_train <- predict(fit, train_x) #predict train values
+predict_test  <- predict(fit, test_x)  #predict test values
+
+
+cm_train <- confusionMatrix(train_y$status, predict_train)                      # generate confusion matrix for training data
+cm_test  <- confusionMatrix(test_y$status, predict_test, positive = "Critical") # generate confusion matrix for test data
+
+#Confusion Matrix of Test Data
+cm_test
+
+```
